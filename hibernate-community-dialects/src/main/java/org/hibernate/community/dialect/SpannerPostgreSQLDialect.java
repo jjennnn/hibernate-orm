@@ -18,15 +18,31 @@ import org.hibernate.community.dialect.aggregate.SpannerPostgreSQLAggregateSuppo
 import org.hibernate.community.dialect.sequence.SpannerPostgreSQLSequenceSupport;
 import org.hibernate.community.dialect.sql.ast.SpannerPostgreSQLSqlAstTranslator;
 import org.hibernate.dialect.DatabaseVersion;
+import org.hibernate.dialect.function.CountFunction;
+import org.hibernate.dialect.function.InsertSubstringOverlayEmulation;
+import org.hibernate.dialect.function.array.ArrayContainsOperatorFunction;
+import org.hibernate.dialect.function.array.ArrayIncludesOperatorFunction;
+import org.hibernate.dialect.function.json.SpannerPostgreSQLJsonArrayFunction;
+import org.hibernate.dialect.function.json.SpannerPostgreSQLJsonObjectFunction;
+import org.hibernate.query.sqm.CastType;
 import org.hibernate.dialect.FunctionalDependencyAnalysisSupport;
 import org.hibernate.dialect.FunctionalDependencyAnalysisSupportImpl;
 import org.hibernate.dialect.PostgreSQLDialect;
 import org.hibernate.dialect.aggregate.AggregateSupport;
 import org.hibernate.dialect.function.CommonFunctionFactory;
 import org.hibernate.dialect.function.SpannerConcatFunction;
+import org.hibernate.dialect.function.array.SpannerPostgreSQLArrayConcatElementFunction;
+import org.hibernate.dialect.function.array.SpannerPostgreSQLArrayTrimEmulation;
+import org.hibernate.dialect.function.array.SpannerPostgreSQLArrayReplaceFunction;
+import org.hibernate.dialect.function.array.SpannerPostgreSQLArrayRemoveFunction;
+import org.hibernate.dialect.function.array.SpannerPostgreSQLArrayRemoveIndexFunction;
+import org.hibernate.dialect.Replacer;
 import org.hibernate.dialect.function.SpannerPostgreSQLRegexpLikeFunction;
+import org.hibernate.dialect.function.SpannerPostgreSQLTruncFunction;
 import org.hibernate.dialect.lock.internal.NoLockingSupport;
 import org.hibernate.dialect.lock.spi.LockingSupport;
+import org.hibernate.dialect.pagination.LimitHandler;
+import org.hibernate.dialect.pagination.LimitOffsetLimitHandler;
 import org.hibernate.dialect.sequence.SequenceSupport;
 import org.hibernate.dialect.temptable.PersistentTemporaryTableStrategy;
 import org.hibernate.dialect.temptable.TemporaryTableStrategy;
@@ -40,6 +56,7 @@ import org.hibernate.engine.config.spi.ConfigurationService;
 import org.hibernate.engine.config.spi.StandardConverters;
 import org.hibernate.engine.jdbc.dialect.spi.DialectResolutionInfo;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
+import org.hibernate.exception.SQLGrammarException;
 import org.hibernate.metamodel.mapping.EntityMappingType;
 import org.hibernate.metamodel.spi.RuntimeModelCreationContext;
 import org.hibernate.exception.ConstraintViolationException;
@@ -53,7 +70,9 @@ import org.hibernate.query.sqm.mutation.internal.temptable.PersistentTableInsert
 import org.hibernate.query.sqm.mutation.internal.temptable.PersistentTableMutationStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableInsertStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableMutationStrategy;
+import org.hibernate.query.sqm.produce.function.StandardFunctionArgumentTypeResolvers;
 import org.hibernate.service.ServiceRegistry;
+import org.hibernate.sql.ast.SqlAstNodeRenderingMode;
 import org.hibernate.sql.ast.SqlAstTranslator;
 import org.hibernate.sql.ast.SqlAstTranslatorFactory;
 import org.hibernate.sql.ast.spi.LockingClauseStrategy;
@@ -62,7 +81,15 @@ import org.hibernate.sql.ast.spi.StandardSqlAstTranslatorFactory;
 import org.hibernate.sql.ast.tree.Statement;
 import org.hibernate.sql.ast.tree.select.QuerySpec;
 import org.hibernate.sql.exec.spi.JdbcOperation;
+import org.hibernate.tool.schema.extract.internal.InformationExtractorJdbcDatabaseMetaDataImpl;
+import org.hibernate.tool.schema.extract.spi.ExtractionContext;
+import org.hibernate.tool.schema.extract.spi.InformationExtractor;
 import org.hibernate.tool.schema.internal.StandardTableExporter;
+import org.hibernate.type.StandardBasicTypes;
+import org.hibernate.type.descriptor.jdbc.BlobJdbcType;
+import org.hibernate.type.descriptor.jdbc.ClobJdbcType;
+import org.hibernate.type.descriptor.jdbc.SpannerLocalDateTimeJdbcType;
+import org.hibernate.type.descriptor.jdbc.SpannerLocalTimeJdbcType;
 import org.hibernate.type.descriptor.jdbc.SpannerTimeJdbcType;
 import org.hibernate.type.descriptor.sql.internal.ArrayDdlTypeImpl;
 import org.hibernate.type.descriptor.sql.internal.CapacityDependentDdlType;
@@ -116,7 +143,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	// range of a 32-bit integer.
 	// This workaround that is only intended for testing, and should not be used for primary key
 	// values in production.
-	private static final String USE_INTEGER_FOR_PRIMARY_KEY = "hibernate.dialect.spannerpg.use_integer_for_primary_key";
+	private static final String USE_INTEGER_FOR_PRIMARY_KEY = "hibernate.dialect.spanner.use_integer_for_primary_key";
 
 	private boolean useIntegerForPrimaryKey;
 
@@ -128,6 +155,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	private static final Pattern NOT_NULL_CONSTRAINT_PATTERN = Pattern.compile( ".*(must not be NULL in table|does not specify a non-null value for NOT NULL column|Cannot specify a null value for column).*" );
 	private static final Pattern FOREIGN_KEY_CONSTRAINT_PATTERN = Pattern.compile( ".*Foreign key.*(constraint violation on table|constraint violation when deleting or updating referenced key|violated on table).*" );
 	private static final Pattern CHECK_CONSTRAINT_PATTERN = Pattern.compile( ".*Check constraint.*" );
+	private static final Pattern TABLE_DOES_NOT_EXIST_PATTERN = Pattern.compile( ".*relation.*does not exist.*" );
 
 	public SpannerPostgreSQLDialect() {
 		super();
@@ -145,23 +173,116 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	public void initializeFunctionRegistry(FunctionContributions functionContributions) {
 		super.initializeFunctionRegistry( functionContributions );
 
-		CommonFunctionFactory functionFactory = new CommonFunctionFactory( functionContributions );
-		functionFactory.substring_spanner();
-		functionFactory.leftRight_substr();
+		final var functionFactory = new CommonFunctionFactory( functionContributions );
+		final var functionRegistry = functionContributions.getFunctionRegistry();
 
-		var functionRegistry = functionContributions.getFunctionRegistry();
+		functionFactory.leftRight_substr();
+		functionFactory.pi_acos();
+		functionFactory.log_ln();
+		functionFactory.degrees_acos();
+		functionFactory.radians_acos();
+		functionFactory.bitandorxornot_operator();
+		functionFactory.characterLength_length( SqlAstNodeRenderingMode.DEFAULT);
+		functionFactory.dateTrunc();
+		functionRegistry.registerAlternateKey("log10", "log");
+		functionFactory.power_spanner();
+		functionFactory.sqrt_spanner();
+		functionFactory.substr();
+		functionFactory.position_locate_spanner();
+		functionFactory.round_spanner();
+		functionFactory.log_spanner();
+		functionFactory.sinh_exp();
+		functionFactory.cosh_exp();
+		functionFactory.tanh_exp();
+		functionRegistry.register(
+				"count",
+				new CountFunction(
+						this,
+						functionContributions.getTypeConfiguration(),
+						SqlAstNodeRenderingMode.DEFAULT,
+						"||",
+						"varchar",
+						true
+				)
+		);
+		functionRegistry.registerPattern(
+				"chr",
+				"'~'",
+				functionContributions.getTypeConfiguration().getBasicTypeRegistry().resolve( StandardBasicTypes.STRING )
+		);
+		functionRegistry.registerPattern(
+				"var_pop",
+				"(avg(?1 * ?1)-power(cast(avg(?1) as float8),cast(2 as float8)))" );
+		functionRegistry.registerPattern(
+				"stddev_pop",
+				"sqrt(avg(?1 * ?1)-power(cast(avg(?1) as float8),cast(2 as float8)))" );
+
+		functionFactory.varSamp_sumCount_spanner();
+		functionFactory.stddevSamp_sumCount_spanner();
+
+		functionFactory.octetLength_pattern("length(?1)");
+		functionFactory.bitLength_pattern("length(?1)*8");
+		functionFactory.sha("sha256(?1)");
+
 		functionRegistry.register( "concat",
 				new SpannerConcatFunction( functionContributions.getTypeConfiguration()) );
 		functionRegistry.register( "regexp_like",
 				new SpannerPostgreSQLRegexpLikeFunction(functionContributions.getTypeConfiguration()));
+		functionRegistry.register( "trunc",
+				new SpannerPostgreSQLTruncFunction(functionContributions.getTypeConfiguration()));
+		functionRegistry.registerAlternateKey("truncate", "trunc");
+		functionRegistry.register( "overlay",
+				new InsertSubstringOverlayEmulation(functionContributions.getTypeConfiguration(), false));
+
+		// Postgres uses # instead of ^ for XOR
+		functionRegistry.patternDescriptorBuilder( "bitxor", "(?1#?2)" )
+				.setExactArgumentCount( 2 )
+				.setArgumentTypeResolver( StandardFunctionArgumentTypeResolvers.ARGUMENT_OR_IMPLIED_RESULT_TYPE )
+				.register();
+
+		functionRegistry.register( "json_array",
+				new SpannerPostgreSQLJsonArrayFunction( functionContributions.getTypeConfiguration() ) );
+		functionRegistry.register( "json_object",
+				new SpannerPostgreSQLJsonObjectFunction( functionContributions.getTypeConfiguration() ) );
+
+		functionFactory.unnest_postgresql( false );
+		functionFactory.arrayLength_spanner();
+
+		functionRegistry.register( "array_prepend", new SpannerPostgreSQLArrayConcatElementFunction( true ) );
+		functionRegistry.register( "array_append", new SpannerPostgreSQLArrayConcatElementFunction( false ) );
+		functionRegistry.register( "array_trim", new SpannerPostgreSQLArrayTrimEmulation() );
+		functionRegistry.register( "array_replace", new SpannerPostgreSQLArrayReplaceFunction() );
+		functionRegistry.register( "array_remove", new SpannerPostgreSQLArrayRemoveFunction() );
+		functionRegistry.register( "array_remove_index", new SpannerPostgreSQLArrayRemoveIndexFunction( true ) );
+		functionRegistry.register( "array_contains", new ArrayContainsOperatorFunction( false, functionContributions.getTypeConfiguration() ) );
+		functionRegistry.register( "array_includes", new ArrayIncludesOperatorFunction( false, functionContributions.getTypeConfiguration() ) );
+		functionRegistry.register( "array_includes_nullable", new ArrayIncludesOperatorFunction( true, functionContributions.getTypeConfiguration() ) );
 	}
 
 	@Override
 	protected void registerJsonFunction(CommonFunctionFactory functionFactory) {
+		functionFactory.jsonObject_postgresql();
+		functionFactory.jsonArray_postgresql();
+		functionFactory.jsonSet_postgresql();
+		functionFactory.jsonRemove_postgresql();
+		functionFactory.jsonReplace_postgresql();
+		functionFactory.jsonArrayInsert_postgresql();
 	}
 
 	@Override
 	protected void registerArrayFunctions(CommonFunctionFactory functionFactory) {
+		functionFactory.array_postgresql();
+		functionFactory.arrayAggregate();
+		functionFactory.arrayConcat_postgresql();
+		functionFactory.arrayPrepend_postgresql();
+		functionFactory.arrayAppend_postgresql();
+		functionFactory.arrayIntersects_postgresql();
+		functionFactory.arrayGet_bracket();
+		functionFactory.arraySlice_operator();
+		functionFactory.arrayReplace();
+		functionFactory.arrayReverse_unnest();
+		functionFactory.arraySort_unnest();
+		functionFactory.arrayToString_postgresql();
 	}
 
 	@Override
@@ -179,6 +300,14 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
+	public String getArrayTypeName(String javaElementTypeName, String elementTypeName, Integer maxLength) {
+		if ( elementTypeName != null && elementTypeName.equals( "varchar" ) ) {
+			elementTypeName = "text";
+		}
+		return super.getArrayTypeName( javaElementTypeName, elementTypeName, maxLength );
+	}
+
+	@Override
 	public StandardTableExporter getTableExporter() {
 		return SPANNER_TABLE_EXPORTER;
 	}
@@ -191,6 +320,11 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	@Override
 	public SequenceSupport getSequenceSupport() {
 		return SPANNER_SEQUENCE_SUPPORT;
+	}
+
+	@Override
+	public LimitHandler getLimitHandler() {
+		return LimitOffsetLimitHandler.INSTANCE;
 	}
 
 	@Override
@@ -289,6 +423,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 		return switch (columnTypeName) {
 			case "character varying" -> Types.VARCHAR;
 			case "timestamp with time zone" -> Types.TIMESTAMP_WITH_TIMEZONE;
+			case "bigint" -> Types.BIGINT;
 			default -> super.resolveSqlTypeCode( columnTypeName, typeConfiguration );
 		};
 	}
@@ -417,15 +552,18 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 		final var jdbcTypeRegistry = typeContributions.getTypeConfiguration()
 				.getJdbcTypeRegistry();
 
-		jdbcTypeRegistry.addDescriptor(SpannerTimeJdbcType.INSTANCE);
-
-		jdbcTypeRegistry.addDescriptor(PostgreSQLUUIDJdbcType.INSTANCE);
+		jdbcTypeRegistry.addDescriptor( SpannerLocalDateTimeJdbcType.INSTANCE );
+		jdbcTypeRegistry.addDescriptor( SpannerLocalTimeJdbcType.INSTANCE );
+		jdbcTypeRegistry.addDescriptor( SpannerTimeJdbcType.INSTANCE );
+		jdbcTypeRegistry.addDescriptor( Types.BLOB, BlobJdbcType.BLOB_BINDING );
+		jdbcTypeRegistry.addDescriptor( Types.CLOB, ClobJdbcType.CLOB_BINDING );
+		jdbcTypeRegistry.addDescriptor( PostgreSQLUUIDJdbcType.INSTANCE );
 
 		// Replace the standard array constructor
-		jdbcTypeRegistry.addTypeConstructor(PostgreSQLArrayJdbcTypeConstructor.INSTANCE);
+		jdbcTypeRegistry.addTypeConstructor( PostgreSQLArrayJdbcTypeConstructor.INSTANCE );
 
-		jdbcTypeRegistry.addDescriptorIfAbsent(PostgreSQLCastingJsonJdbcType.JSONB_INSTANCE);
-		jdbcTypeRegistry.addTypeConstructorIfAbsent(PostgreSQLCastingJsonArrayJdbcTypeConstructor.JSONB_INSTANCE);
+		jdbcTypeRegistry.addDescriptorIfAbsent( PostgreSQLCastingJsonJdbcType.JSONB_INSTANCE );
+		jdbcTypeRegistry.addTypeConstructorIfAbsent( PostgreSQLCastingJsonArrayJdbcTypeConstructor.JSONB_INSTANCE );
 	}
 
 	@Override
@@ -472,7 +610,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 				temporalAccessor = offsetTime.atDate( LocalDate.of( 1970, 1, 1 ) );
 			}
 			else if ( temporalAccessor instanceof LocalDateTime localDateTime) {
-				temporalAccessor = localDateTime.atOffset( ZoneOffset.UTC );
+				temporalAccessor = localDateTime.atOffset(  ZoneOffset.UTC );
 			}
 			else if ( temporalAccessor instanceof Instant instant) {
 				temporalAccessor = instant.atOffset(  ZoneOffset.UTC );
@@ -521,16 +659,50 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 
 	@Override
 	public String timestampaddPattern(TemporalUnit unit, TemporalType temporalType, IntervalType intervalType) {
+		final String temporal = temporalType == TemporalType.DATE ? "cast(?3 as " + castType(TIMESTAMP) + ")" : "?3";
 		return intervalType != null
-				? "(?2+?3)"
-				: "cast(?3+" + intervalPattern( unit ) + " as " + castTemporalType( temporalType ) + ")";
+				? "(?2+" + temporal + ")"
+				: "cast(" + temporal + "+" + intervalPattern(unit) + " as " + castTemporalType(temporalType) + ")";
+	}
+
+	@Override
+	public String timestampdiffPattern(TemporalUnit unit, TemporalType fromTemporalType, TemporalType toTemporalType) {
+		final String pattern = switch (unit) {
+			case YEAR -> "extract(year from ?3)-extract(year from ?2)";
+			// For month, we also need to account for years
+			case MONTH -> "(extract(year from ?3)-extract(year from ?2))*12+(extract(month from ?3)-extract(month from ?2))";
+			// Quarter is month diff / 3
+			case QUARTER ->
+				"((extract(year from ?3)-extract(year from ?2))*12+(extract(month from ?3)-extract(month from ?2)))/3";
+			case WEEK -> "(extract(epoch from ?3)-extract(epoch from ?2))/604800";
+			case DAY -> "(extract(epoch from ?3)-extract(epoch from ?2))/86400";
+			case HOUR -> "(extract(epoch from ?3)-extract(epoch from ?2))/3600";
+			case MINUTE -> "(extract(epoch from ?3)-extract(epoch from ?2))/60";
+			case SECOND -> "extract(epoch from ?3)-extract(epoch from ?2)";
+			case NANOSECOND -> "(extract(epoch from ?3)-extract(epoch from ?2))*1e9";
+			case NATIVE -> "extract(epoch from ?3)-extract(epoch from ?2)";
+			default -> "extract(epoch from ?3)-extract(epoch from ?2)";
+		};
+
+		return "cast(" + pattern + " as bigint)";
+	}
+
+	@Override
+	public String castPattern(CastType from, CastType to) {
+		if (from == CastType.STRING && to == CastType.TIME) {
+			return "cast('1970-01-01 ' || ?1 as timestamp with time zone)";
+		}
+		if (from == CastType.TIME && to == CastType.STRING) {
+			return "to_char(?1, 'HH24:MI:SS.MS')";
+		}
+		return super.castPattern(from, to);
 	}
 
 	private static String intervalPattern(TemporalUnit unit) {
 		return switch (unit) {
 			case NANOSECOND -> "cast(concat(cast((?2)/1e3 as text), ' microsecond') as interval)";
 			case NATIVE -> "cast(concat(cast((?2) as text), ' second') as interval)";
-			case QUARTER -> "cast(concat(cast((?2) as text), ' quarter') as interval)";
+			case QUARTER -> "cast(concat(cast((?2)*3 as text), ' month') as interval)";
 			case WEEK -> "cast(concat(cast((?2) as text), ' week') as interval)";
 			default -> "cast(concat(cast((?2) as text), ' " + unit + "') as interval)";
 		};
@@ -566,6 +738,11 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
+	public boolean supportsTupleCounts() {
+		return false;
+	}
+
+	@Override
 	public boolean supportsUserDefinedTypes() {
 		return false;
 	}
@@ -595,9 +772,19 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 		return false;
 	}
 
+	@Override
+	public boolean supportsRowValueConstructorSyntax() {
+		return false;
+	}
+
 	// ALL subqueries with operators other than <>/!= are not supported
 	@Override
 	public boolean supportsRowValueConstructorSyntaxInQuantifiedPredicates() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsValuesList() {
 		return false;
 	}
 
@@ -618,6 +805,16 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 
 	@Override
 	public String currentTime() {
+		return currentTimestampWithTimeZone();
+	}
+
+	@Override
+	public String currentLocalTimestamp() {
+		return currentTimestampWithTimeZone();
+	}
+
+	@Override
+	public String currentLocalTime() {
 		return currentTimestampWithTimeZone();
 	}
 
@@ -655,6 +852,11 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	@Override
 	public boolean supportsWindowFunctions() {
 		return false;
+	}
+
+	@Override
+	public int getInExpressionCountLimit() {
+		return 100;
 	}
 
 	@Override
@@ -721,6 +923,11 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
+	public boolean addPartitionKeyToPrimaryKey() {
+		return false;
+	}
+
+	@Override
 	public String getDual() {
 		return "unnest(ARRAY[1])";
 	}
@@ -728,6 +935,33 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	@Override
 	public String getFromDualForSelectOnly() {
 		return " from " + getDual() + " dual";
+	}
+
+	public Replacer datetimeFormat(String format) {
+		return org.hibernate.dialect.OracleDialect.datetimeFormat(format, true, false)
+				.replace("SSSSSS", "US")
+				.replace("SSSSS", "US")
+				.replace("SSSS", "US")
+				.replace("SSS", "MS")
+				.replace("SS", "MS")
+				.replace("S", "MS")
+				// use ISO day in week, as per DateTimeFormatter
+				.replace("ee", "ID")
+				.replace("e", "fmID")
+				// TZR is TZ in Postgres
+				.replace("zzz", "TZ")
+				.replace("zz", "TZ")
+				.replace("z", "TZ")
+				.replace("ZZZ", "OF")
+				.replace("ZZ", "OF")
+				.replace("Z", "OF")
+				.replace("xxx", "OF")
+				.replace("xx", "OF")
+				.replace("x", "OF")
+				.replace("a", "AM")
+				// Spanner-specific overrides
+				.replace("hh", "HH12")
+				.replace("h", "HH12");
 	}
 
 	@Override
@@ -745,6 +979,16 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 
 	public boolean supportsCteHeaderColumnList() {
 		return false;
+	}
+
+	@Override
+	public boolean supportsTupleDistinctCounts() {
+		return false;
+	}
+
+	@Override
+	public InformationExtractor getInformationExtractor(ExtractionContext extractionContext) {
+		return new InformationExtractorJdbcDatabaseMetaDataImpl( extractionContext );
 	}
 
 	@Override
@@ -784,6 +1028,9 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	private @Nullable JDBCException handleConstraintViolatedException(SQLException sqlException, String message, String sql) {
 		if (sqlException.getErrorCode() == 6) {
 			return new ConstraintViolationException( message, sqlException, ConstraintViolationException.ConstraintKind.UNIQUE, null );
+		}
+		else if (sqlException.getErrorCode() == 5 || matches( TABLE_DOES_NOT_EXIST_PATTERN, message )) {
+			return new SQLGrammarException( message, sqlException );
 		}
 		else if (matches( NOT_NULL_CONSTRAINT_PATTERN, message )) {
 			return new ConstraintViolationException( message, sqlException, ConstraintViolationException.ConstraintKind.NOT_NULL, null );

@@ -2210,13 +2210,27 @@ public class AnnotationMetaEntity extends AnnotationMeta {
 //			}
 //		}
 		if ( isOrderParam( typeName ) || isRestrictionParam( typeName ) ) {
-			final TypeMirror typeArgument = getTypeArgument( parameterType );
+			TypeMirror typeArgument = getTypeArgument( parameterType );
 			if ( entityType != null ) {
 				if ( typeArgument == null ) {
 					missingTypeArgError( entityType, parameter, typeName );
 				}
-				else if ( !types.isSameType( typeArgument, entityType.asType() ) ) {
-					wrongTypeArgError( entityType, parameter, typeName );
+				else {
+					if ( typeArgument.getKind() == TypeKind.WILDCARD ) {
+						final TypeMirror superBound = ((WildcardType) typeArgument).getSuperBound();
+						if ( superBound == null ) {
+							if ( requireBoundedWildcard( typeName ) ) {
+								missingTypeArgError( entityType, parameter, typeName );
+							}
+							// else: allow; see HHH-20230
+						}
+						typeArgument = superBound;
+					}
+					if ( typeArgument != null ) {
+						if ( !types.isSameType( typeArgument, entityType.asType() ) ) {
+							wrongTypeArgError( entityType, parameter, typeName );
+						}
+					}
 				}
 			}
 			else {
@@ -2271,6 +2285,10 @@ public class AnnotationMetaEntity extends AnnotationMeta {
 	private void wrongTypeArgError(TypeElement entityType, VariableElement parameter, String parameterType) {
 		message( parameter, "mismatched type of " + message( parameterType, entityType ),
 				Diagnostic.Kind.ERROR );
+	}
+
+	private boolean requireBoundedWildcard(String typeName) {
+		return !context.getJakartaDataSortCompliance() || !typeName.startsWith( JD_SORT );
 	}
 
 	private void missingTypeArgError(TypeElement entityType, VariableElement parameter, String parameterType) {
@@ -2363,7 +2381,7 @@ public class AnnotationMetaEntity extends AnnotationMeta {
 						for ( TypeMirror arg : type.getTypeArguments() ) {
 							switch ( arg.getKind() ) {
 								case WILDCARD:
-									return ((WildcardType) arg).getSuperBound();
+									return arg;
 								case ARRAY:
 								case DECLARED:
 								case TYPEVAR:

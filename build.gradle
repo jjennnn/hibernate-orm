@@ -23,7 +23,7 @@ plugins {
 	id 'org.hibernate.orm.database-service' apply false
 	id 'biz.aQute.bnd' version '7.2.1' apply false
 
-	id "com.diffplug.spotless" version "8.2.1"
+	id "com.diffplug.spotless" version "8.3.0"
 	id 'org.checkerframework' version '1.0.2'
 	id 'org.hibernate.orm.build.jdks'
 
@@ -76,4 +76,22 @@ idea {
 	module {
 		name = "hibernate-orm"
 	}
+}
+
+tasks.register('copyDependenciesSonar', Copy) {
+    description = "Aggregates all runtime dependencies for Sonar CLI analysis."
+
+    def targetProjects = subprojects.findAll { it.name != 'reporting' }
+
+    targetProjects.each { sub ->
+        evaluationDependsOn(sub.path)
+
+        if (sub.plugins.hasPlugin('java')) {
+            from(sub.configurations.runtimeClasspath)
+        }
+    }
+
+    into(layout.buildDirectory.dir("sonar-dependencies"))
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }

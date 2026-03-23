@@ -44,6 +44,7 @@ import org.hibernate.boot.spi.MetadataBuildingOptions;
 import org.hibernate.boot.spi.NaturalIdUniqueKeyBinder;
 import org.hibernate.boot.spi.PropertyData;
 import org.hibernate.boot.spi.SecondPass;
+import org.hibernate.cfg.MappingSettings;
 import org.hibernate.community.dialect.DerbyDialect;
 import org.hibernate.community.dialect.FirebirdDialect;
 import org.hibernate.community.dialect.GaussDBDialect;
@@ -177,6 +178,20 @@ abstract public class DialectFeatureChecks {
 		}
 	}
 
+	public static class SupportPooledOptimizer implements DialectFeatureCheck {
+		@Override
+		public boolean apply(Dialect dialect) {
+			return !"none".equals( dialect.getDefaultProperties().get( MappingSettings.PREFERRED_POOLED_OPTIMIZER ) );
+		}
+	}
+
+	public static class SupportsJdbcEscapes implements DialectFeatureCheck {
+		@Override
+		public boolean apply(Dialect dialect) {
+			return !(dialect instanceof SpannerPostgreSQLDialect);
+		}
+	}
+
 	public static class SupportsNumericPrimaryKey implements DialectFeatureCheck {
 		@Override
 		public boolean apply(Dialect dialect) {
@@ -206,7 +221,7 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsIdentityColumns implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			if ( dialect instanceof SpannerPostgreSQLDialect ) {
+			if ( dialect instanceof SpannerPostgreSQLDialect || dialect instanceof SpannerDialect ) {
 				// Spanner supports identity columns but it doesn't support returning integer type since
 				// Spanner supports only bit reversed positive.
 				return false;
@@ -254,7 +269,20 @@ abstract public class DialectFeatureChecks {
 	public static class SupportsConcurrentTransactions implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
 			// Currently Spanner Emulator doesn't allow concurrent modifications
-			return !(dialect instanceof SpannerPostgreSQLDialect);
+			return !(dialect instanceof SpannerPostgreSQLDialect || dialect instanceof SpannerDialect);
+		}
+	}
+
+	public static class SupportSelectPreviousSequence implements DialectFeatureCheck {
+		@Override
+		public boolean apply(Dialect dialect) {
+			try {
+				dialect.getSequenceSupport().getSelectSequencePreviousValString( "" );
+				return true;
+			}
+			catch (RuntimeException e) {
+				return false;
+			}
 		}
 	}
 
@@ -319,6 +347,7 @@ abstract public class DialectFeatureChecks {
 		public boolean apply(Dialect dialect) {
 			return !( dialect instanceof DB2Dialect
 					|| dialect instanceof DerbyDialect
+					|| dialect instanceof SpannerPostgreSQLDialect
 					|| dialect instanceof FirebirdDialect );
 		}
 	}
@@ -349,7 +378,15 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsLockTimeouts implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return dialect.supportsLockTimeouts();
+			return dialect.getLockingSupport().getMetadata().getLockTimeoutType( Timeouts.ONE_SECOND ) != LockTimeoutType.NONE;
+		}
+	}
+
+	public static class SupportsNoWait implements DialectFeatureCheck {
+		public boolean apply(Dialect dialect) {
+			return dialect.getLockingSupport()
+					.getMetadata()
+					.getLockTimeoutType( Timeouts.NO_WAIT ) != LockTimeoutType.NONE;
 		}
 	}
 
@@ -398,19 +435,19 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsSkipLocked implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return dialect.supportsSkipLocked();
+			return dialect.getLockingSupport().getMetadata().getLockTimeoutType( Timeouts.SKIP_LOCKED ) != LockTimeoutType.NONE;
 		}
 	}
 
 	public static class SupportNoWait implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return dialect.supportsNoWait();
+			return dialect.getLockingSupport().getMetadata().getLockTimeoutType( Timeouts.NO_WAIT ) != LockTimeoutType.NONE;
 		}
 	}
 
 	public static class SupportsWait implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return dialect.supportsWait();
+			return dialect.getLockingSupport().getMetadata().getLockTimeoutType( Timeouts.ONE_SECOND ) != LockTimeoutType.NONE;
 		}
 	}
 
@@ -481,7 +518,7 @@ abstract public class DialectFeatureChecks {
 		public boolean apply(Dialect dialect) {
 			return dialect instanceof DB2Dialect
 				|| dialect instanceof OracleDialect
-				|| dialect instanceof PostgreSQLDialect
+				|| (dialect instanceof PostgreSQLDialect && !(dialect instanceof SpannerPostgreSQLDialect))
 				|| dialect instanceof SQLServerDialect
 				|| dialect instanceof DerbyDialect
 				|| dialect instanceof MySQLDialect && !(dialect instanceof TiDBDialect)
@@ -493,7 +530,7 @@ abstract public class DialectFeatureChecks {
 		public boolean apply(Dialect dialect) {
 			return dialect instanceof DB2Dialect
 				|| dialect instanceof OracleDialect
-				|| dialect instanceof PostgreSQLDialect
+				|| (dialect instanceof PostgreSQLDialect && !(dialect instanceof SpannerPostgreSQLDialect))
 				|| dialect instanceof SQLServerDialect;
 		}
 	}
@@ -526,7 +563,7 @@ abstract public class DialectFeatureChecks {
 	public static class SupportsCharCodeConversion implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
 			// Derby doesn't support the `ASCII` or `CHR` functions
-			return !( dialect instanceof DerbyDialect );
+			return !( dialect instanceof DerbyDialect || dialect instanceof SpannerPostgreSQLDialect);
 		}
 	}
 
@@ -609,7 +646,6 @@ abstract public class DialectFeatureChecks {
 		public boolean apply(Dialect dialect) {
 			if (dialect instanceof DerbyDialect
 				|| dialect instanceof FirebirdDialect
-				|| dialect instanceof SpannerPostgreSQLDialect
 				|| dialect instanceof InformixDialect) {
 				return false;
 			}
@@ -718,13 +754,7 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsMedian implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return !( dialect instanceof MySQLDialect && !(dialect instanceof MariaDBDialect)
-					|| dialect instanceof SpannerDialect
-					|| dialect instanceof SybaseDialect
-					|| dialect instanceof DerbyDialect
-					|| dialect instanceof FirebirdDialect
-					|| dialect instanceof InformixDialect
-					|| dialect instanceof DB2Dialect db2 && db2.getDB2Version().isBefore( 11 ) );
+			return definesFunction( dialect, "median" );
 		}
 	}
 
@@ -1050,7 +1080,19 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsArrayComparison implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return !(dialect instanceof SpannerPostgreSQLDialect);
+			return !(dialect instanceof SpannerPostgreSQLDialect || dialect instanceof SpannerDialect);
+		}
+	}
+
+	public static class SupportsTableWithoutPrimaryKey implements DialectFeatureCheck {
+		public boolean apply(Dialect dialect) {
+			return !(dialect instanceof SpannerPostgreSQLDialect || dialect instanceof SpannerDialect);
+		}
+	}
+
+	public static class SupportsVarSampFunction implements DialectFeatureCheck {
+		public boolean apply(Dialect dialect) {
+			return definesFunction( dialect, "var_samp" );
 		}
 	}
 
@@ -1062,7 +1104,7 @@ abstract public class DialectFeatureChecks {
 
 	public static class SupportsUserDefinedTypes implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
-			return definesDdlType( dialect, SqlTypes.NAMED_ENUM );
+			return definesDdlType( dialect, SqlTypes.STRUCT );
 		}
 	}
 
@@ -1093,6 +1135,12 @@ abstract public class DialectFeatureChecks {
 	public static class SupportsArrayContains implements DialectFeatureCheck {
 		public boolean apply(Dialect dialect) {
 			return definesFunction( dialect, "array_contains" );
+		}
+	}
+
+	public static class SupportsArrayContainsNullable implements DialectFeatureCheck {
+		public boolean apply(Dialect dialect) {
+			return definesFunction( dialect, "array_contains_nullable" );
 		}
 	}
 
