@@ -259,7 +259,8 @@ public abstract class AbstractMultiIdEntityLoader<T> implements MultiIdEntityLoa
 			MultiIdLoadOptions loadOptions,
 			SharedSessionContractImplementor session) {
 		final var lockOptions = lockOptions( loadOptions );
-		final List<T> results = arrayList( ids.length );
+		// Pre-initialize with nulls to support positional insertion
+		final List<T> results = new ArrayList<>( java.util.Collections.nCopies( ids.length, null ) );
 		final var unresolvableIds = resolveInCachesIfEnabled(
 				ids,
 				loadOptions,
@@ -267,7 +268,7 @@ public abstract class AbstractMultiIdEntityLoader<T> implements MultiIdEntityLoa
 				session,
 				(position, entityKey, resolvedRef) -> {
 					//noinspection unchecked
-					results.add( (T) resolvedRef );
+					results.set( position, (T) resolvedRef );
 				}
 		);
 		if ( !isEmpty( unresolvableIds ) ) {
