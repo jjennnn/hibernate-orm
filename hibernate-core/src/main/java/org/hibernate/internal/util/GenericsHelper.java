@@ -250,7 +250,7 @@ public final class GenericsHelper {
 		final var typeArguments = context.getActualTypeArguments();
 		final var typeParameters = clazz.getTypeParameters();
 		for ( int idx = 0; idx < typeParameters.length; idx++ ) {
-			if ( typeVariable.getName().equals( typeParameters[idx].getName() ) ) {
+			if ( typeVariable.getGenericDeclaration().equals( typeParameters[idx].getGenericDeclaration() ) && typeVariable.getName().equals( typeParameters[idx].getName() ) ) {
 				return substituteTypeArguments( typeArguments[idx], context );
 			}
 		}
